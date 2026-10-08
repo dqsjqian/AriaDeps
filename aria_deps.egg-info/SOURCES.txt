@@ -1,0 +1,12 @@
+pyproject.toml
+aria_deps/__init__.py
+aria_deps/deps_build.py
+aria_deps/deps_sources.py
+aria_deps/providers.py
+aria_deps.egg-info/PKG-INFO
+aria_deps.egg-info/SOURCES.txt
+aria_deps.egg-info/dependency_links.txt
+aria_deps.egg-info/requires.txt
+aria_deps.egg-info/top_level.txt
+tests/test_deps_build.py
+tests/test_deps_sources.py
