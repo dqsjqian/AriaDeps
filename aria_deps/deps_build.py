@@ -1008,8 +1008,8 @@ def build_environment(prefix, c=None, cxx=None, toolchain=None):
     return context
 
 
-def cmake_arguments(prefix, context):
-    common = [f'-DCMAKE_INSTALL_PREFIX={prefix}', '-DCMAKE_BUILD_TYPE=Release',
+def cmake_arguments(prefix, context, config='Release'):
+    common = [f'-DCMAKE_INSTALL_PREFIX={prefix}', f'-DCMAKE_BUILD_TYPE={config}',
               '-DCMAKE_POSITION_INDEPENDENT_CODE=ON', '-DBUILD_SHARED_LIBS=OFF',
               f'-DCMAKE_PREFIX_PATH={prefix}',
               f"-DCMAKE_C_COMPILER={context['c']['path']}",
@@ -1184,7 +1184,7 @@ def windows_toolchain() -> str:
 
 
 def build_cmake(source: Path, build: Path, prefix: Path, jobs: int,
-                dependency: Dependency, common: list[str]) -> None:
+                dependency: Dependency, common: list[str], config: str = 'Release') -> None:
     generator = os.environ.get('CMAKE_GENERATOR', '').strip()
     selected = windows_toolchain() if sys.platform == 'win32' else ''
     visual_studio = generator.lower().startswith('visual studio') or (not generator and selected == 'msvc')
@@ -1199,8 +1199,8 @@ def build_cmake(source: Path, build: Path, prefix: Path, jobs: int,
     run([*configure, '-S', str(source), '-B', str(build), *common, *libdir, *dependency.options])
     # --config is accepted by single-config generators and required by VS,
     # Xcode and Ninja Multi-Config, including MSVC builds without a VS generator.
-    run(['cmake', '--build', str(build), '--parallel', str(jobs), '--config', 'Release'])
-    run(['cmake', '--install', str(build), '--config', 'Release'])
+    run(['cmake', '--build', str(build), '--parallel', str(jobs), '--config', config])
+    run(['cmake', '--install', str(build), '--config', config])
 
 
 def msys2_tool(name: str, compiler: str | None = None) -> str:
@@ -1459,7 +1459,7 @@ PATCH_VERSIONS = {'gumbo': {'0.10.1'}, 'quickjs': {'2026-06-04'},
                   'sqlite_modern_cpp': {'3.2'}, 'doctest': {'2.5.3'}}
 
 
-def install_component(dep, available, run_root, prefix, jobs, common, expected_source=None):
+def install_component(dep, available, run_root, prefix, jobs, common, expected_source=None, config='Release'):
     # One flat directory per dependency; a rebuild discards the previous one.
     holder = run_root / dep.name
     shutil.rmtree(holder, ignore_errors=True)
@@ -1518,7 +1518,7 @@ def _layout(work, prefix, source_dir):
 
 def install(file, work, prefix, source_dir, *, config, profile='tests', tls_backend='auto',
             only='', offline=False, versions=(), update=False, jobs=None,
-            c=None, cxx=None, toolchain=None):
+            c=None, cxx=None, toolchain=None, build_config='Release'):
     """Resolve, prepare workspaces and install every selected dependency."""
     init_project(config)
     recipes = config.effective_configure()(config.recipes, profile, tls_backend)
@@ -1560,7 +1560,7 @@ def install(file, work, prefix, source_dir, *, config, profile='tests', tls_back
             staged.mkdir()
             for name in sorted(completed):
                 copy_component_files(prefix, staged, previous['components'][name]['files'])
-        common = cmake_arguments(prefix, context)
+        common = cmake_arguments(prefix, context, build_config)
         try:
             with installation(prefix, identity, selected, metadata) as (done, state):
                 if done is None:
@@ -1578,7 +1578,8 @@ def install(file, work, prefix, source_dir, *, config, profile='tests', tls_back
                         continue
                     before = inventory(prefix)
                     records.append(install_component(dep, available[dep.name], runs, prefix,
-                                                     jobs, common, identities[dep.name]))
+                                                     jobs, common, identities[dep.name],
+                                                     config=build_config))
                     after = inventory(prefix)
                     changed = [name for name, content in before.items() if after.get(name) != content]
                     if changed:
