@@ -34,6 +34,7 @@ import csv
 import hashlib
 import inspect
 import json
+import ntpath
 import os
 import platform
 import re
@@ -49,7 +50,7 @@ import urllib.request
 import uuid
 import zipfile
 from dataclasses import asdict, dataclass, field, replace
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from . import deps_sources as sources
 
@@ -863,10 +864,31 @@ def recipe_digest(dependencies):
     functions += (build_cmake,) if any(dep.kind != 'openssl' for dep in dependencies) else ()
     def recipe_record(dep):
         record = asdict(dep)
-        # Hooks are code, not data: fingerprint by qualified name.
+        # Project hooks and their helpers affect the installed result. Hash
+        # their module contents as well as the function, not just its name.
         for key in ('post_install', 'post_build'):
             hook = record[key]
-            record[key] = getattr(hook, '__qualname__', None) if hook is not None else None
+            if hook is None:
+                record[key] = None
+            else:
+                try:
+                    if not inspect.isfunction(hook):
+                        raise TypeError('not a Python function')
+                    hook_source = inspect.getsource(hook)
+                    module_file = inspect.getsourcefile(hook)
+                except (OSError, TypeError) as error:
+                    raise ValueError(f'{dep.name} {key} must be a source-readable Python function') from error
+                record[key] = {
+                    'name': hook.__module__ + '.' + hook.__qualname__,
+                    'source': hook_source,
+                    'module_sha256': sha256(Path(module_file)) if module_file else '',
+                    'helpers': {
+                        name: sha256(Path(inspect.getsourcefile(helper)))
+                        for name in hook.__code__.co_names
+                        for helper in [hook.__globals__.get(name)]
+                        if inspect.isfunction(helper) and inspect.getsourcefile(helper)
+                    },
+                }
         return record
     return fingerprint({'recipes': [recipe_record(dep) for dep in dependencies],
                         'patches': patches,
@@ -945,7 +967,7 @@ def copy_component_files(source, destination, files):
 
 
 def verify_prefix(prefix, resolution, dependencies, selected, c=None, cxx=None, toolchain=None,
-                  c_arg1='', cxx_arg1='', source_dir=None):
+                  c_arg1='', cxx_arg1='', source_dir=None, build_config=None, cmake_options=None):
     """Read-only check that the prefix was built from the current sources."""
     rebuild = 'run python tools/build.py deps (add --profile tests for test builds)'
     state = read_state(prefix)
@@ -953,6 +975,11 @@ def verify_prefix(prefix, resolution, dependencies, selected, c=None, cxx=None, 
         raise ValueError(f'Unverified/legacy prefix {prefix}: {rebuild}')
     if not state.get('source_dir') or not state.get('components'):
         raise ValueError(f'Legacy prefix has no editable source receipt: {rebuild}')
+    context = state['context']
+    if build_config is not None and context.get('configuration') != build_config:
+        raise ValueError(f'Dependency build configuration differs; expected {build_config}; {rebuild}')
+    if cmake_options is not None and context.get('cmake_options', []) != list(cmake_options):
+        raise ValueError(f'Dependency CMake options differ; {rebuild}')
     source_dir = Path(source_dir or state['source_dir'])
     identities = sources.identities(source_dir, dependencies)
     if not selected <= identities.keys():
@@ -1010,6 +1037,7 @@ def build_environment(prefix, c=None, cxx=None, toolchain=None):
 
 def cmake_arguments(prefix, context, config='Release'):
     common = [f'-DCMAKE_INSTALL_PREFIX={prefix}', f'-DCMAKE_BUILD_TYPE={config}',
+              f'-DCMAKE_TRY_COMPILE_CONFIGURATION={config}',
               '-DCMAKE_POSITION_INDEPENDENT_CODE=ON', '-DBUILD_SHARED_LIBS=OFF',
               f'-DCMAKE_PREFIX_PATH={prefix}',
               f"-DCMAKE_C_COMPILER={context['c']['path']}",
@@ -1366,25 +1394,46 @@ def download(cache: Path, dependency: Dependency, offline: bool) -> Path:
 
 def extract(archive: Path, destination: Path, root_name: str) -> Path:
     """Safe extraction: refuse absolute paths, escapes and non-regular members."""
+    reserved = getattr(ntpath, 'isreserved',
+                       lambda name: PureWindowsPath(name).is_reserved())
+    seen = {}
+
     def safe(member_name: str) -> PurePosixPath:
         path = PurePosixPath(member_name)
         if (path.is_absolute() or ".." in path.parts or "\\" in member_name
-                or not path.parts):
-            raise ValueError(f"Refusing unsafe archive member: {member_name}")
+                or not path.parts or (root_name and path.parts[0] != root_name)
+                or any(':' in part or part.endswith(('.', ' ')) or reserved(part)
+                       for part in path.parts)):
+            raise ValueError(f"Unsafe archive member rejected: {member_name}")
         target = (destination / member_name).resolve()
         if destination.resolve() not in target.parents:
             raise ValueError(f"Refusing escaping archive member: {member_name}")
         return path
 
+    def validate(member_name, directory):
+        path = safe(member_name)
+        key = path.as_posix().casefold()
+        if key in seen and not (directory and seen[key]):
+            raise ValueError(f"Unsafe archive member duplicates another path: {member_name}")
+        if any(seen.get(parent.as_posix().casefold()) is False for parent in path.parents):
+            raise ValueError(f"Unsafe archive member has a file parent: {member_name}")
+        if not directory and any(name.startswith(key + '/') for name in seen):
+            raise ValueError(f"Unsafe archive member conflicts with a directory: {member_name}")
+        seen[key] = directory
+
     def write(target: Path, data, executable: bool) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
+        with target.open('xb') as output:
+            output.write(data)
         target.chmod(0o755 if executable else 0o644)
 
     if archive.suffix == ".zip" or archive.name.endswith(".zip"):
         with zipfile.ZipFile(archive) as package:
             for info in package.infolist():
-                safe(info.filename)
+                kind = (info.external_attr >> 16) & 0o170000
+                if kind not in (0, 0o040000, 0o100000):
+                    raise ValueError(f"Unsafe archive member is not regular: {info.filename}")
+                validate(info.filename, info.is_dir())
             for info in package.infolist():
                 if info.is_dir():
                     continue
@@ -1393,7 +1442,9 @@ def extract(archive: Path, destination: Path, root_name: str) -> Path:
     else:
         with tarfile.open(archive) as package:
             for member in package.getmembers():
-                safe(member.name)
+                if not (member.isdir() or member.isfile()):
+                    raise ValueError(f"Unsafe archive member is not regular: {member.name}")
+                validate(member.name, member.isdir())
             for member in package.getmembers():
                 if member.isdir():
                     continue
@@ -1436,10 +1487,15 @@ def fetch_git(work: Path, workspace: Path, dependency: Dependency, offline: bool
 
 def output_path(value: Path) -> Path:
     path = value.expanduser().resolve()
-    if path == Path.home():
-        raise ValueError(f"Refusing the home directory as output: {path}")
-    for system in ("/usr", "/bin", "/sbin", "/etc", "/System", "/Library", "/opt"):
-        root = Path(system)
+    if path in (Path.home(), Path(path.anchor)) or path in Path.home().parents:
+        raise ValueError(f"Refusing the home directory or filesystem root as output: {path}")
+    systems = ["/usr", "/bin", "/sbin", "/etc", "/System", "/Library", "/opt"]
+    if os.name == 'nt':
+        systems.extend(os.environ[key] for key in
+                       ('SystemRoot', 'ProgramFiles', 'ProgramFiles(x86)', 'ProgramData')
+                       if os.environ.get(key))
+    for system in systems:
+        root = Path(system).resolve()
         if path == root or root in path.parents:
             raise ValueError(f"Refusing to install into a system directory: {path}")
     if path.exists() and not path.is_dir():
@@ -1470,7 +1526,7 @@ def install_component(dep, available, run_root, prefix, jobs, common, expected_s
     if dep.kind == 'openssl':
         build_openssl(source, prefix, jobs)
     else:
-        build_cmake(source, holder / 'build', prefix, jobs, dep, common)
+        build_cmake(source, holder / 'build', prefix, jobs, dep, common, config)
     licenses = copy_licenses(prefix, source, dep)
     if dep.post_build is not None:
         dep.post_build(prefix, source, dep)
@@ -1518,7 +1574,7 @@ def _layout(work, prefix, source_dir):
 
 def install(file, work, prefix, source_dir, *, config, profile='tests', tls_backend='auto',
             only='', offline=False, versions=(), update=False, jobs=None,
-            c=None, cxx=None, toolchain=None, build_config='Release'):
+            c=None, cxx=None, toolchain=None, build_config='Release', cmake_options=()):
     """Resolve, prepare workspaces and install every selected dependency."""
     init_project(config)
     recipes = config.effective_configure()(config.recipes, profile, tls_backend)
@@ -1529,6 +1585,8 @@ def install(file, work, prefix, source_dir, *, config, profile='tests', tls_back
     resolution = read_resolved(file, [dep.name for dep in recipes])
     dependencies = locked_recipes(resolution, recipes, config)
     context = build_environment(prefix, c, cxx, toolchain)
+    context['configuration'] = build_config
+    context['cmake_options'] = list(cmake_options)
     jobs = jobs or min(os.cpu_count() or 1, 8)
 
     (work / 'cache').mkdir(parents=True, exist_ok=True)
@@ -1560,7 +1618,7 @@ def install(file, work, prefix, source_dir, *, config, profile='tests', tls_back
             staged.mkdir()
             for name in sorted(completed):
                 copy_component_files(prefix, staged, previous['components'][name]['files'])
-        common = cmake_arguments(prefix, context, build_config)
+        common = [*cmake_arguments(prefix, context, build_config), *cmake_options]
         try:
             with installation(prefix, identity, selected, metadata) as (done, state):
                 if done is None:
@@ -1595,8 +1653,13 @@ def install(file, work, prefix, source_dir, *, config, profile='tests', tls_back
 
 
 def verify(file, work, prefix, source_dir, *, config, profile='tests', tls_backend='auto', only='',
-           c=None, cxx=None, c_arg1='', cxx_arg1='', toolchain=None, cmake_platform=''):
-    """Read-only verification that the prefix matches the current sources."""
+           c=None, cxx=None, c_arg1='', cxx_arg1='', toolchain=None, cmake_platform='',
+           build_config=None, cmake_options=None):
+    """Read-only verification that the prefix matches sources and requested settings.
+
+    None preserves the recorded setting for callers predating these options.
+    Pass an explicit configuration/options tuple to enforce the consumer's ABI.
+    """
     init_project(config)
     recipes = config.effective_configure()(config.recipes, profile, tls_backend)
     selected = dependency_selection(only, recipes)
@@ -1604,7 +1667,7 @@ def verify(file, work, prefix, source_dir, *, config, profile='tests', tls_backe
     resolution = read_resolved(file, [dep.name for dep in recipes])
     dependencies = locked_recipes(resolution, recipes, config)
     verify_prefix(prefix, resolution, dependencies, selected, c, cxx, toolchain,
-                   c_arg1, cxx_arg1, source_dir)
+                   c_arg1, cxx_arg1, source_dir, build_config, cmake_options)
     if sys.platform == 'win32' and cmake_platform.lower() not in ('', 'x64'):
         raise ValueError('The Windows dependency prefix targets x64; configure the project for x64')
     print(f'Verified dependency prefix and current source contents: {prefix}')

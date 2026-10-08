@@ -593,6 +593,30 @@ class SourceTests(unittest.TestCase):
                 self.assertEqual(commands[1][-2:], ['--config', 'Release'])
                 self.assertEqual(commands[2][-2:], ['--config', 'Release'])
 
+    def test_component_build_forwards_debug_to_cmake(self):
+        dependency = replace(fixtures.RECIPES[0], artifacts=(), post_build=None)
+        run_root = self.root / 'runs'
+        run_root.mkdir()
+        with patch.object(deps.sources, 'snapshot', return_value={}), \
+                patch.object(deps, 'prepare_source'), patch.object(deps, 'copy_licenses', return_value=[]), \
+                patch.object(deps, 'build_cmake') as build:
+            deps.install_component(dependency, self.root / 'source', run_root,
+                                   self.root / 'prefix', 2, [], config='Debug')
+        self.assertEqual(build.call_args.args[-1], 'Debug')
+
+    def test_hook_source_changes_invalidate_recipe_identity(self):
+        dependency = fixtures.RECIPES[1]
+        expected = deps.recipe_digest([dependency])
+        original = deps.inspect.getsource
+        with patch.object(deps.inspect, 'getsource', side_effect=lambda function:
+                          original(function) + ('\n# changed' if function is dependency.post_build else '')):
+            self.assertNotEqual(deps.recipe_digest([dependency]), expected)
+
+    def test_opaque_hooks_have_an_actionable_error(self):
+        for hook in (print, eval('lambda prefix, source, dep: None')):
+            with self.subTest(hook=hook), self.assertRaisesRegex(ValueError, 'source-readable Python function'):
+                deps.recipe_digest([replace(fixtures.RECIPES[0], post_build=hook)])
+
     def test_selected_gcc_is_not_overridden_by_msvc_on_path(self):
         with patch.dict(deps.os.environ, {'CC': '/toolchain/gcc'}, clear=True), \
                 patch.object(deps.shutil, 'which', return_value='/unrelated/cl'):
@@ -877,6 +901,8 @@ class OfflineTransactionTests(unittest.TestCase):
                     'CMakeLists.txt': ('cmake_minimum_required(VERSION 3.20)\n'
                                        'project(Fixture C CXX)\n' +
                                        ('message(FATAL_ERROR "fixture build failure")\n' if fail else
+                                        'file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/configuration.txt" "${CMAKE_BUILD_TYPE};${FIXTURE_OPTION}")\n'
+                                        'install(FILES "${CMAKE_CURRENT_BINARY_DIR}/configuration.txt" DESTINATION share)\n'
                                         'install(FILES json.hpp DESTINATION include/nlohmann)\n' +
                                         ('install(FILES obsolete.hpp DESTINATION include/nlohmann)\n'
                                          if version == '1.0' else '')))}
@@ -900,7 +926,8 @@ class OfflineTransactionTests(unittest.TestCase):
             entries[name] = {**spec, 'resolved': resolved}
         self.file.write_text(json.dumps({'schema': 2, 'dependencies': entries}))
 
-    def invoke(self, *, versions=(), profile='tests', only='libfoo,libbar,libgit', verify=False, environment=None):
+    def invoke(self, *, versions=(), profile='tests', only='libfoo,libbar,libgit', verify=False,
+               environment=None, build_config='Release', cmake_options=()):
         output = io.StringIO()
         env = dict(os.environ)
         if environment:
@@ -909,14 +936,35 @@ class OfflineTransactionTests(unittest.TestCase):
             cfg = fixtures.make_config()
             if verify:
                 deps.verify(self.file, self.work, self.prefix, self.sources,
-                            config=cfg, profile=profile, tls_backend='openssl', only=only)
+                            config=cfg, profile=profile, tls_backend='openssl', only=only,
+                            build_config=build_config, cmake_options=cmake_options)
             else:
                 deps.install(self.file, self.work, self.prefix, self.sources,
                              config=cfg, profile=profile, tls_backend='openssl', only=only,
-                             offline=True, versions=versions, jobs=1)
+                             offline=True, versions=versions, jobs=1,
+                             build_config=build_config, cmake_options=cmake_options)
         return output.getvalue()
 
-    @unittest.skip("TODO: fixture digest mismatch in upgrade path; needs investigation")
+    def test_configuration_and_options_cannot_reuse_incompatible_prefix(self):
+        self.invoke(only='libfoo')
+        recorded = self.prefix / 'share/configuration.txt'
+        self.assertEqual(recorded.read_text(), 'Release;')
+        self.invoke(only='libfoo', build_config='Debug', cmake_options=('-DFIXTURE_OPTION=first',))
+        self.assertEqual(recorded.read_text(), 'Debug;first')
+        state = deps.read_state(self.prefix)
+        self.assertEqual(state['context']['configuration'], 'Debug')
+        self.assertEqual(state['context']['cmake_options'], ['-DFIXTURE_OPTION=first'])
+        self.invoke(only='libfoo', build_config='Debug', cmake_options=('-DFIXTURE_OPTION=second',))
+        self.assertEqual(recorded.read_text(), 'Debug;second')
+        self.invoke(only='libfoo', verify=True, build_config='Debug',
+                    cmake_options=('-DFIXTURE_OPTION=second',))
+        with self.assertRaisesRegex(ValueError, 'build configuration differs'):
+            self.invoke(only='libfoo', verify=True, build_config='Release',
+                        cmake_options=('-DFIXTURE_OPTION=second',))
+        with self.assertRaisesRegex(ValueError, 'CMake options differ'):
+            self.invoke(only='libfoo', verify=True, build_config='Debug',
+                        cmake_options=('-DFIXTURE_OPTION=first',))
+
     def test_offline_install_upgrade_and_failed_upgrade(self):
         # Install a single dependency offline.
         first = self.invoke(only='libfoo', profile='runtime')
@@ -950,7 +998,7 @@ class OfflineTransactionTests(unittest.TestCase):
         self.specs['dependencies']['libfoo']['version'] = '1.0'
         self.records['libfoo']['requested'] = '2.0'
         self.archive('2.0')
-        upgraded = self.invoke(versions={'libfoo': '2.0'})
+        upgraded = self.invoke(only='libfoo', versions={'libfoo': '2.0'})
         self.assertEqual(header.read_text(), '2.0')
         self.assertFalse((header.parent / 'obsolete.hpp').exists())
 
@@ -958,7 +1006,7 @@ class OfflineTransactionTests(unittest.TestCase):
         self.records['libfoo']['requested'] = '3.0'
         self.archive('3.0', fail=True)
         with self.assertRaisesRegex(subprocess.CalledProcessError, 'returned non-zero exit status'):
-            self.invoke(versions={'libfoo': '3.0'})
+            self.invoke(only='libfoo', versions={'libfoo': '3.0'})
         self.assertEqual(header.read_text(), '2.0')
 
 

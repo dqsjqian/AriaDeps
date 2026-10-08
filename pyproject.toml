@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aria-deps"
-version = "0.1.0"
+version = "0.1.1"
 description = "Project-agnostic dependency pipeline: resolve, fetch, patch, build and install C/C++ dependencies"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = { file = "LICENSE" }
 
 [project.optional-dependencies]
 test = []
