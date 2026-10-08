@@ -12,7 +12,7 @@ from aria_deps import deps_build, deps_sources
 class ConsoleTests(unittest.TestCase):
     def test_legacy_encoding_escapes_only_unrepresentable_text(self):
         raw = io.BytesIO()
-        stream = io.TextIOWrapper(raw, encoding="cp1252", errors="strict")
+        stream = io.TextIOWrapper(raw, encoding="cp1252", errors="strict", newline="\n")
         safe_print("café", "目录", file=stream, sep=" / ", flush=True)
         self.assertEqual(raw.getvalue().decode("cp1252"), "café / \\u76ee\\u5f55\n")
         self.assertEqual(stream.errors, "strict")
@@ -23,7 +23,7 @@ class ConsoleTests(unittest.TestCase):
             safe_print("目录", end="!")
         self.assertEqual(stream.getvalue(), "目录!")
         raw = io.BytesIO()
-        stream = io.TextIOWrapper(raw, encoding="utf-8")
+        stream = io.TextIOWrapper(raw, encoding="utf-8", newline="\n")
         safe_print("目录", file=stream, flush=True)
         self.assertEqual(raw.getvalue().decode("utf-8"), "目录\n")
 
