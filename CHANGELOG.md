@@ -8,4 +8,5 @@
 - Reject unsafe cross-platform archive paths and non-regular members before
   extracting any files; preserve existing files on failure.
 - Restore the offline install, upgrade and failed-upgrade rollback regression.
+- Keep Unicode dependency paths usable when build logs use a legacy encoding.
 - Add Linux, macOS and Windows package and contract CI, and the MIT license file.

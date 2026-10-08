@@ -53,6 +53,7 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from . import deps_sources as sources
+from ._console import safe_print as print
 
 
 _GLOBAL_PROVIDERS: dict = {}

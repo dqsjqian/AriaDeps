@@ -26,6 +26,8 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
+from ._console import safe_print as print
+
 
 def fingerprint(value):
     """A stable JSON fingerprint; deps.py shares the exact same encoding."""
