@@ -1,7 +1,0 @@
-Metadata-Version: 2.4
-Name: aria-deps
-Version: 0.1.0
-Summary: Project-agnostic dependency pipeline: resolve, fetch, patch, build and install C/C++ dependencies
-License: MIT
-Requires-Python: >=3.10
-Provides-Extra: test
