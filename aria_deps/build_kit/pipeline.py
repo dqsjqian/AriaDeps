@@ -41,6 +41,12 @@ class Pipeline:
         bench_pattern: Regex matching benchmark executable names.
         package_include: Extra header dirs to include in the package.
         extra_args: Callable(parser) adding project-specific CLI options.
+        build_dir_fn: Callable(args) -> Path for custom build directory logic.
+        validate_fn: Callable(args) for custom argument validation.
+        custom_commands: Dict of {name: callable(args, pipeline) -> int} for
+            project-specific commands (e.g. cache-key, deps-check). Each
+            callable receives parsed args and the Pipeline instance, returns
+            exit code.
     """
 
     def __init__(
@@ -56,6 +62,7 @@ class Pipeline:
         extra_args: object = None,
         build_dir_fn: object = None,
         validate_fn: object = None,
+        custom_commands: dict | None = None,
     ):
         self.name = name
         self.root = root or Path(sys.argv[0]).resolve().parents[1]
@@ -68,6 +75,7 @@ class Pipeline:
         self.extra_args = extra_args
         self.build_dir_fn = build_dir_fn
         self.validate_fn = validate_fn
+        self.custom_commands = custom_commands or {}
         self._qt_prefix: Path | None = None
         self._msys2_bin: Path | None = None
 
@@ -84,9 +92,11 @@ class Pipeline:
             description=f"Build pipeline for {self.name}: "
                         "deps -> build -> test -> bench -> package"
         )
+        choices = ("deps", "build", "test", "bench", "package", "all", "clean")
+        choices += tuple(self.custom_commands.keys())
         p.add_argument(
             "command", nargs="?",
-            choices=("deps", "build", "test", "bench", "package", "all", "clean"),
+            choices=choices,
             default="all",
             help="Pipeline stage (default: all = deps+build+test)",
         )
@@ -259,7 +269,9 @@ class Pipeline:
 
         rc = 0
         for stage in stages:
-            if stage == "deps":
+            if stage in self.custom_commands:
+                rc = self.custom_commands[stage](args, self)
+            elif stage == "deps":
                 rc = self.stage_deps(args)
             elif stage == "build":
                 build_dir = self.stage_build(args)
