@@ -54,6 +54,8 @@ class Pipeline:
         bench_pattern: str = "bench",
         package_include: tuple[Path, ...] = (),
         extra_args: object = None,
+        build_dir_fn: object = None,
+        validate_fn: object = None,
     ):
         self.name = name
         self.root = root or Path(sys.argv[0]).resolve().parents[1]
@@ -64,8 +66,17 @@ class Pipeline:
         self.bench_pattern = re.compile(bench_pattern, re.IGNORECASE)
         self.package_include = package_include
         self.extra_args = extra_args
+        self.build_dir_fn = build_dir_fn
+        self.validate_fn = validate_fn
         self._qt_prefix: Path | None = None
         self._msys2_bin: Path | None = None
+
+    def _default_build_dir(self, args) -> Path:
+        if args.build_dir:
+            return args.build_dir
+        if self.build_dir_fn:
+            return self.build_dir_fn(args)
+        return self.root / "build" / args.config.lower()
 
     # ── CLI ──────────────────────────────────────────────────────────────
     def _make_parser(self) -> argparse.ArgumentParser:
@@ -98,10 +109,11 @@ class Pipeline:
     # ── Stages ───────────────────────────────────────────────────────────
     def stage_deps(self, args) -> int:
         print("[build] === Stage: deps ===")
-        if not self.deps:
+        deps = self.deps(args) if callable(self.deps) else self.deps
+        if not deps:
             print("[build] No dependencies configured, skipping")
             return 0
-        for label, cmd in self.deps:
+        for label, cmd in deps:
             # Allow dynamic commands: callable(args) -> list[str]
             if callable(cmd):
                 cmd = cmd(args)
@@ -127,7 +139,7 @@ class Pipeline:
 
     def stage_build(self, args) -> Path:
         print("[build] === Stage: build ===")
-        build_dir = args.build_dir or (self.root / "build" / args.config.lower())
+        build_dir = self._default_build_dir(args)
 
         for tool in ("cmake", "git"):
             if not env.has_tool(tool):
@@ -204,6 +216,9 @@ class Pipeline:
     def run(self, argv=None) -> int:
         args = self._make_parser().parse_args(argv)
 
+        if self.validate_fn:
+            self.validate_fn(args)
+
         if args.command == "clean":
             build_root = self.root / "build"
             print(f"[build] Removing {build_root}")
@@ -220,7 +235,7 @@ class Pipeline:
                 self._qt_prefix = env.find_qt_prefix()
         self._msys2_bin = env.find_msys2_bin()
 
-        build_dir: Path = args.build_dir or (self.root / "build" / args.config.lower())
+        build_dir: Path = self._default_build_dir(args)
 
         def need_build() -> bool:
             return not (build_dir / "CMakeCache.txt").is_file()
