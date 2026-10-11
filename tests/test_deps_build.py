@@ -641,6 +641,52 @@ class SourceTests(unittest.TestCase):
             self.assertEqual(deps.os.environ['CC'], original)
             self.assertEqual(deps.os.environ['CFLAGS'], '/O2')
 
+    def test_openssl_uses_gcc_when_c_compiler_is_clang(self):
+        # The conda clang wrapper prepends -L<toolchain>/lib, so the legacy
+        # provider would link the toolchain's libcrypto instead of the
+        # just-built static library. OpenSSL must be built with gcc instead.
+        configure_calls = []
+        def fake_run(cmd, **kwargs):
+            configure_calls.append(cmd)
+        with patch.object(deps.sys, 'platform', 'linux'), \
+                patch.object(deps.shutil, 'which',
+                             side_effect=lambda name: '/toolchain/bin/gcc' if name == 'gcc'
+                             else '/toolchain/bin/' + name), \
+                patch.object(deps, 'run', side_effect=fake_run):
+            deps.build_openssl(self.root, self.root / 'prefix', 1,
+                               c_compiler='/toolchain/bin/clang')
+        configure = configure_calls[0]
+        self.assertIn('CC=/toolchain/bin/gcc', configure)
+        self.assertNotIn('CC=/toolchain/bin/clang', configure)
+
+    def test_openssl_keeps_gcc_compiler_untouched(self):
+        configure_calls = []
+        with patch.object(deps.sys, 'platform', 'linux'), \
+                patch.object(deps, 'run',
+                             side_effect=lambda cmd, **kw: configure_calls.append(cmd)):
+            deps.build_openssl(self.root, self.root / 'prefix', 1,
+                               c_compiler='/usr/bin/gcc')
+        configure = configure_calls[0]
+        self.assertFalse(any(arg.startswith('CC=') for arg in configure))
+
+    def test_openssl_without_known_compiler_keeps_old_behavior(self):
+        configure_calls = []
+        with patch.object(deps.sys, 'platform', 'linux'), \
+                patch.object(deps, 'run',
+                             side_effect=lambda cmd, **kw: configure_calls.append(cmd)):
+            deps.build_openssl(self.root, self.root / 'prefix', 1)
+        configure = configure_calls[0]
+        self.assertFalse(any(arg.startswith('CC=') for arg in configure))
+
+    def test_openssl_clang_without_gcc_is_an_actionable_error(self):
+        with patch.object(deps.sys, 'platform', 'linux'), \
+                patch.object(deps.shutil, 'which',
+                             side_effect=lambda name: '/usr/bin/' + name if name != 'gcc' else None), \
+                patch.object(deps, 'run'):
+            with self.assertRaisesRegex(ValueError, 'no gcc is on PATH'):
+                deps.build_openssl(self.root, self.root / 'prefix', 1,
+                                   c_compiler='/toolchain/bin/clang')
+
     def test_compiler_path_with_spaces_is_one_executable(self):
         executable = self.root / 'compiler with spaces'
         executable.write_text('fixture')

@@ -1259,7 +1259,29 @@ def msys2_tool(name: str, compiler: str | None = None) -> str:
         "install MSYS2 or set MSYS2_ROOT")
 
 
-def build_openssl(source: Path, prefix: Path, jobs: int) -> None:
+def _openssl_c_compiler(c_compiler):
+    """Select the C compiler for the OpenSSL build.
+
+    OpenSSL must not be built with a conda clang wrapper: the wrapper
+    prepends -L<toolchain>/lib to every link, so the legacy provider
+    links the toolchain's libcrypto.so.3 (which hides the ossl_prov_*
+    internals) instead of the just-built static library, and the link
+    fails under -z defs. gcc builds OpenSSL fine, so force gcc whenever
+    the selected C compiler is clang. MSVC and MinGW keep their own
+    compiler handling and are unaffected.
+    """
+    if not c_compiler or sys.platform == 'win32':
+        return None
+    stem = Path(c_compiler).stem.lower()
+    if stem in ('clang', 'clang++') or stem.startswith('clang-'):
+        gcc = shutil.which('gcc')
+        if gcc is None:
+            raise ValueError('OpenSSL cannot be built with clang here and no gcc is on PATH')
+        return gcc
+    return None
+
+
+def build_openssl(source: Path, prefix: Path, jobs: int, c_compiler=None) -> None:
     windows = sys.platform == "win32"
     toolchain = windows_toolchain() if windows else ""
     if toolchain == "mingw":
@@ -1275,6 +1297,9 @@ def build_openssl(source: Path, prefix: Path, jobs: int) -> None:
     else:
         target = []
     compiler_options = []
+    openssl_cc = _openssl_c_compiler(c_compiler)
+    if openssl_cc is not None:
+        compiler_options.append('CC=' + openssl_cc)
     if toolchain == 'msvc':
         # OpenSSL's Windows makefile template quotes CC itself. Passing the
         # shell-quoted CC used by CMake would produce ""C:\Program Files\..."".
@@ -1516,7 +1541,8 @@ PATCH_VERSIONS = {'gumbo': {'0.10.1'}, 'quickjs': {'2026-06-04'},
                   'sqlite_modern_cpp': {'3.2'}, 'doctest': {'2.5.3'}}
 
 
-def install_component(dep, available, run_root, prefix, jobs, common, expected_source=None, config='Release'):
+def install_component(dep, available, run_root, prefix, jobs, common, expected_source=None, config='Release',
+                      c_compiler=None):
     # One flat directory per dependency; a rebuild discards the previous one.
     holder = run_root / dep.name
     shutil.rmtree(holder, ignore_errors=True)
@@ -1525,7 +1551,7 @@ def install_component(dep, available, run_root, prefix, jobs, common, expected_s
     actual_source = sources.snapshot(available, source, expected_source)
     prepare_source(source, dep)
     if dep.kind == 'openssl':
-        build_openssl(source, prefix, jobs)
+        build_openssl(source, prefix, jobs, c_compiler)
     else:
         build_cmake(source, holder / 'build', prefix, jobs, dep, common, config)
     licenses = copy_licenses(prefix, source, dep)
@@ -1638,7 +1664,8 @@ def install(file, work, prefix, source_dir, *, config, profile='tests', tls_back
                     before = inventory(prefix)
                     records.append(install_component(dep, available[dep.name], runs, prefix,
                                                      jobs, common, identities[dep.name],
-                                                     config=build_config))
+                                                     config=build_config,
+                                                     c_compiler=context['c']['path']))
                     after = inventory(prefix)
                     changed = [name for name, content in before.items() if after.get(name) != content]
                     if changed:
