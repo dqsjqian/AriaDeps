@@ -662,6 +662,7 @@ class SourceTests(unittest.TestCase):
     def test_openssl_keeps_gcc_compiler_untouched(self):
         configure_calls = []
         with patch.object(deps.sys, 'platform', 'linux'), \
+                patch.object(deps.shutil, 'which', return_value='/usr/bin/perl'), \
                 patch.object(deps, 'run',
                              side_effect=lambda cmd, **kw: configure_calls.append(cmd)):
             deps.build_openssl(self.root, self.root / 'prefix', 1,
@@ -672,6 +673,7 @@ class SourceTests(unittest.TestCase):
     def test_openssl_without_known_compiler_keeps_old_behavior(self):
         configure_calls = []
         with patch.object(deps.sys, 'platform', 'linux'), \
+                patch.object(deps.shutil, 'which', return_value='/usr/bin/perl'), \
                 patch.object(deps, 'run',
                              side_effect=lambda cmd, **kw: configure_calls.append(cmd)):
             deps.build_openssl(self.root, self.root / 'prefix', 1)
